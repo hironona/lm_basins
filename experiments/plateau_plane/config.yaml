@@ -1,0 +1,9 @@
+# Plateau geometry on a surface through the last-token activations of three sentences.
+model: gpt2                          # any TransformerLens model name
+prefix: "The house is"
+words: [big, large, in] # sentence = prefix + " " + word (one token each); the surface's origin is the first
+layer: 0                             # residual stream entering block `layer` (0 = embeddings, n_layers = last block output)
+surface: spherical                   # flat (affine plane) | spherical (slerp-like surface through the three points)
+resolution: 100                      # grid points per axis
+margin: 0.5                          # padding around the anchors, as a fraction of their bounding box
+batch_size: 64                       # grid points per Jacobian batch

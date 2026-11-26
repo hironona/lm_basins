@@ -1,0 +1,28 @@
+# Steering basins: steering vectors, basin check, and heatmaps of the m-token joint KL and the norm ratio over planes
+# of steering offsets a v + b u_k (u_k random, orthogonal to v, ||u_k|| = ||v||). See README.md.
+model: Qwen/Qwen3-8B      # chat model (chat template with thinking disabled)
+dtype: bfloat16
+layer: 18                 # steer the residual stream entering block 18 (of 36)
+scope: context            # context: offset at every context token | last: only at the last context token
+n_docs: 256               # en_zh vector: Wikipedia articles per language
+n_prompts: 128            # refusal vector: harmful and harmless instructions each
+alpha_max: 12             # behavioral sweep along x + alpha v, alpha in [0, alpha_max]
+resolution: 40            # grid points per axis
+n_planes: 3               # planes span(v, u_k); heatmaps show the mean over them
+n_decoded: 4              # measure after the context and after each of the first n_decoded unsteered greedy tokens
+m: 4                      # joint KL over the next m tokens
+tree_nodes: 512           # KL estimator: prefix-tree nodes per depth (exact head) ...
+mc_samples: 512           # ... and Monte-Carlo samples for the tail beyond the tree
+n_contexts: 1             # contexts drawn per experiment from its held-out pool
+seed: null                # seed of the context draw (null: a fresh draw every run)
+
+experiments:              # name = steering vector (en_zh | refusal); target = behavior label to steer towards
+  en_zh:
+    target: zh
+    pool:                 # held-out items of <data-dir>/<source>.jsonl (items used by the vectors are skipped)
+      - {source: wiki_en, chat: false, prefix_words: 24}   # Wikipedia openings cut mid-sentence
+      - {source: harmless, chat: true}                     # Alpaca instructions as a chat user turn
+  refusal:
+    target: refusal
+    pool:
+      - {source: harmless, chat: true}

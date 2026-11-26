@@ -1,0 +1,26 @@
+[project]
+name = "lm-basins"
+version = "0.1.0"
+description = "Geometry of activation plateaus and steering basins in language models (TransformerLens)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets>=3.0",
+    "matplotlib==3.10.6",
+    "numpy==1.26.4",
+    "pyyaml>=6.0.3",
+    "scipy>=1.17.0",
+    "torch>=2.10.0",
+    "tqdm==4.67.1",
+    "transformer-lens==2.16.1",
+    "transformers==4.56.2",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
