@@ -71,6 +71,14 @@ For the en→zh and refusal steering vectors v (Finlayson et al. 2026), on conte
    - **residual shift** arrows: [(f(h) − f(x)) − (h − x)] projected onto (u_k, v) in units of ‖v‖, i.e. how blocks
      L..last move the steered point within the plane relative to the unsteered one;
    - the **greedy label** (en / zh / other by script; refusal / non-refusal by refusal phrases).
+4. **Trajectory-difference criterion** (`diff_points`, default both α_cls and α*). From the context steered by α v, the
+   greedy tokens z_1..z_J; from the unsteered context, y_1..y_J. At each j, d_j = h_j − x_j is the input of block L at
+   the last position of the steered ctx + z_≤j minus that of the unsteered ctx + y_≤j, and cos(d_j, v) is reported
+   (d_0 = α v, so cos = 1 at j = 0). On `n_planes` planes x_j + a d_j + b u_k (u_k random ⟂ d_j, ‖u_k‖ = ‖d_j‖),
+   placed at that last position only (the prefix ctx + y_≤j is otherwise unsteered; (a, b) = (1, 0) is h_j), the same
+   KL / label / norm ratio / residual shift are measured → `*_diff_<point>.png` (rows j, cos(d_j, v) in the row labels)
+   and `*_diff_cos.png` (cos(d_j, v) and ‖d_j‖/‖v‖ against j). For j ≥ 1 the steering offset never reaches position
+   n−1+j at block L's input, so d_j there comes only from the different tokens z_≤j vs y_≤j.
 
 ```bash
 python experiments/steering_basins/prepare_data.py                      # once, needs internet

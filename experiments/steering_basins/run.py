@@ -7,6 +7,12 @@ Steering basins (GPU). For n_contexts contexts per experiment, drawn from held-o
     grid     per context and plane k: offsets a v + b u_k at the context positions (y_j teacher-forced, never steered);
              at j = 0..J the m-token joint KL, the greedy label, the log norm ratio (block-L input -> last block output)
              and the in-plane residual shift -> plane_XX.pt
+    diff     per context, steered point p (diff_points) and plane k: the steered greedy tokens z_1..z_J (steering
+             alpha_p v) and the unsteered y_1..y_J give, at each j, d_j = h_j - x_j (layer-L input at the last position
+             of ctx + z_<=j steered minus ctx + y_<=j unsteered) and cos(d_j, v). Offsets a d_j + b u_k (u_k random,
+             ⟂ d_j, ||u_k|| = ||d_j||) replace the unsteered x_j at that position only (scope 'last' on the prefix
+             ctx + y_<=j; (a, b) = (1, 0) is h_j); the same measures as the grid -> diff_<p>_plane_XX.pt
+             (run in the grid stage; d_j comes from the basin stage)
     merge    plane means -> result.pt, summary.json
 `--stage all` runs everything. For several GPUs: --stage vectors, then one process per GPU with
 --stage basin and then --stage grid (--shard i --num-shards n), then --stage merge. Run from the project root:
@@ -24,6 +30,7 @@ import time
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -33,7 +40,7 @@ from common.config import get_device, load_config  # noqa: E402
 from common.joint_kl import JointKL  # noqa: E402
 from common.lm import block_input, chat_prompt, encode, eos_ids, load_model  # noqa: E402
 from common.metrics import NormRatio, project_onto  # noqa: E402
-from common.steering import greedy_decode, orthogonal_directions, prefix_states  # noqa: E402
+from common.steering import context_state, greedy_decode, orthogonal_directions, prefix_states  # noqa: E402
 from labels import CLASSIFIER_OF_TARGET, classify  # noqa: E402
 from vectors import steering_vectors  # noqa: E402
 
@@ -42,6 +49,8 @@ QUICK = dict(n_docs=4, n_prompts=4, alpha_max=4, resolution=4, n_planes=2, n_dec
 EXTENT_FACTOR = 1.5  # grid half-width = 1.5 x the farthest steered point / end of the target run on the ray
 LABEL_TOKENS = 8  # greedy tokens decoded at every grid point for its behavior label
 BATCH_POINTS = 50  # grid points per batched pass
+DIFF_EXTENT = 1.5  # diff grid half-width in units of ||d_j|| (the steered activation h_j sits at a = 1)
+MIN_DIFF_NORM = 1e-4  # relative to ||v||: positions j with a smaller ||d_j|| end the diff trajectory
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -127,14 +136,54 @@ def run_basin(model, config, name, ctx, v, eos, out_dir):
                 basin['points'][p]['kl'].append(kl[r].tolist())
                 basin['points'][p]['label_after'].append(classify(texts[r], classifier))
 
+    diff = steered_trajectories(model, config, ids, ids_full, y, basin, v, eos)
+
     os.makedirs(out_dir, exist_ok=True)
     torch.save({
         'experiment': name, 'context': ctx, 'n_ctx': n, 'last_token': model.tokenizer.decode(ids[-1:]),
         'decoded_ids': y, 'decoded_text': y_text, 'target': target, 'classifier': classifier, 'layer': layer,
         'scope': scope, 'm': config['m'], 'n_planes': config['n_planes'], 'extent': extent,
         'coords': np.linspace(-extent, extent, config['resolution']), 'basin': basin,
-        'references': [jkl.reference() for jkl in jkls],
+        'references': [jkl.reference() for jkl in jkls], 'diff': diff,
     }, os.path.join(out_dir, 'basin.pt'))
+
+
+def steered_trajectories(model, config, ids, ids_full, y, basin, v, eos):
+    """
+    For each steered point p in diff_points: greedy z_1..z_J from the context steered by alpha_p v, and at j = 0..J
+    (J = min(|y|, |z|)) d_j = h_j - x_j, the steered minus unsteered input of block L at the last position of
+    ctx + z_<=j and ctx + y_<=j. d_0 = alpha_p v when the scope covers the last context token.
+    """
+    layer, scope, n = config['layer'], config['scope'], ids.shape[0]
+    _, acts = prefix_states(model, ids_full, n, layer, capture=True)
+    x_traj = acts['src'][0, n - 1:]  # [|y| + 1, d]
+    out = {}
+    for p in config['diff_points']:
+        if p not in basin['points']:
+            print(f"[diff] {p}: no such steered point, skipped")
+            continue
+        alpha = basin['points'][p]['alpha']
+        off = (alpha * v)[None]
+        z = greedy_decode(model, context_state(model, ids, layer, off, scope), config['n_decoded'], eos)[0]
+        z = list(itertools.takewhile(lambda t: t not in eos, z))
+        n_meas = min(len(y), len(z)) + 1
+        ids_z = torch.cat([ids, torch.tensor(z, device=ids.device, dtype=ids.dtype)])
+        _, acts_q = prefix_states(model, ids_z, n, layer, off, scope, capture=True)
+        d = acts_q['src'][0, n - 1:n - 1 + n_meas] - x_traj[:n_meas]
+        small = (d.norm(dim=-1) < MIN_DIFF_NORM * v.norm()).nonzero()
+        n_meas = int(small[0]) if len(small) else n_meas
+        if n_meas == 0:
+            print(f"[diff] {p}: d_0 = 0, skipped")
+            continue
+        d = d[:n_meas]
+        cos = F.cosine_similarity(d, v[None], dim=-1)
+        out[p] = {'alpha': alpha, 'steered_ids': z, 'steered_text': [model.tokenizer.decode([t]) for t in z],
+                  'd': d.cpu(), 'cos': cos.tolist(), 'd_norm': (d.norm(dim=-1) / v.norm()).tolist(),
+                  'extent': DIFF_EXTENT, 'coords': np.linspace(-DIFF_EXTENT, DIFF_EXTENT, config['resolution'])}
+        print(f"[diff] {p}: alpha={alpha:.3f}, z={out[p]['steered_text']!r}, "
+              f"cos(d_j, v)={[round(c, 3) for c in out[p]['cos']]}, ||d_j||/||v||="
+              f"{[round(r, 3) for r in out[p]['d_norm']]}")
+    return out
 
 
 def run_plane(model, config, ctx, v, eos, out_dir, k):
@@ -193,6 +242,59 @@ def run_plane(model, config, ctx, v, eos, out_dir, k):
                os.path.join(out_dir, f'plane_{k:02d}.pt'))
 
 
+def run_diff_plane(model, config, ctx, eos, out_dir, p, k):
+    """Plane k of steered point p: at each j, offsets a d_j + b u_k at the last position of ctx + y_<=j only."""
+    info = torch.load(os.path.join(out_dir, 'basin.pt'), weights_only=False)
+    if p not in info['diff']:
+        return
+    dp, layer, classifier = info['diff'][p], info['layer'], info['classifier']
+    ids, _ = setup_context(model, config, ctx)
+    n, d_all = ids.shape[0], dp['d'].to(ids.device).float()
+    n_meas = d_all.shape[0]
+    ids_full = torch.cat([ids, torch.tensor(info['decoded_ids'], device=ids.device, dtype=ids.dtype)])
+    states_p, acts = prefix_states(model, ids_full, n, layer, capture=True)
+    jkls = [make_jkl(model, st, config, eos, ref) for st, ref in zip(states_p[:n_meas], info['references'])]
+    x_src, x_out = acts['src'][0], acts['final'][0]
+    del states_p, acts
+
+    coords = torch.tensor(dp['coords'], device=ids.device, dtype=torch.float32)
+    res = len(coords)
+    aa, bb = (g.reshape(-1) for g in torch.meshgrid(coords, coords, indexing='ij'))  # rows over a, columns over b
+    n_pts = res * res
+    kl = np.zeros((n_pts + 1, n_meas, config['m']), dtype=np.float32)  # last row: the steered activation (1, 0)
+    labels = np.empty((n_pts + 1, n_meas), dtype=object)
+    shift = np.zeros((n_pts + 1, n_meas, 2), dtype=np.float32)
+    log_ratio = np.zeros((n_pts + 1, n_meas), dtype=np.float32)
+    t0 = time.time()
+    for j in range(n_meas):
+        t = n - 1 + j  # the measured position (last of ctx + y_<=j)
+        d = d_all[j]
+        u = orthogonal_directions(d, info['n_planes'])[k]
+        axes = torch.stack([u, d])
+        offsets = torch.cat([aa[:, None] * d + bb[:, None] * u, d[None]])
+        shift_x = x_out[t] - x_src[t]
+        h_out = torch.empty(n_pts + 1, x_src.shape[1], device=ids.device)
+        for start in range(0, n_pts + 1, BATCH_POINTS):
+            sl = slice(start, min(n_pts + 1, start + BATCH_POINTS))
+            states_q, acts = prefix_states(model, ids_full[:t + 1], t + 1, layer, offsets[sl], 'last', capture=True)
+            h_out[sl] = acts['final'][:, t]
+            shift[sl, j] = project_onto((acts['final'] - acts['src'])[:, t] - shift_x, axes).cpu().numpy()
+            kl[sl, j] = jkls[j](states_q[0])['kl'].numpy()
+            texts = model.tokenizer.batch_decode(greedy_decode(model, states_q[0], LABEL_TOKENS, eos))
+            labels[sl, j] = [classify(txt, classifier) for txt in texts]
+            del states_q, acts
+        h_src = x_src[t][None] + offsets
+        ratio = NormRatio(x_src[t], x_out[t][None], h_src[:n_pts], h_out[:n_pts, None])
+        log_ratio[:, j] = ratio(h_src, h_out[:, None])[:, 0].cpu().numpy()
+    sec = (time.time() - t0) / (n_pts * n_meas)
+    print(f"[diff] {info['experiment']} / {ctx['id']} {p} plane {k}: {res}x{res} points x {n_meas} positions, "
+          f"{sec:.2f} s/point")
+    grid = lambda a: a[:n_pts].reshape(res, res, *a.shape[1:])  # noqa: E731
+    torch.save({'kl': grid(kl), 'labels': grid(labels), 'log_ratio': grid(log_ratio), 'shift': grid(shift),
+                'point_kl': kl[-1], 'point_label': labels[-1], 'point_log_ratio': log_ratio[-1],
+                'seconds_per_point': sec}, os.path.join(out_dir, f'diff_{p}_plane_{k:02d}.pt'))
+
+
 def merge(out_dir):
     info = torch.load(os.path.join(out_dir, 'basin.pt'), weights_only=False)
     info.pop('references')
@@ -204,6 +306,15 @@ def merge(out_dir):
     res['target_fraction'] = np.mean([pl['labels'] == info['target'] for pl in planes], axis=0).astype(np.float32)
     for p, point in res['basin']['points'].items():
         point['log_ratio'] = np.mean([pl['point_log_ratio'][p] for pl in planes], axis=0).tolist()
+    for p, dp in res.setdefault('diff', {}).items():
+        dplanes = [torch.load(f, weights_only=False)
+                   for f in sorted(glob.glob(os.path.join(out_dir, f'diff_{p}_plane_*.pt')))]
+        assert len(dplanes) == info['n_planes'], f"{out_dir}: {len(dplanes)} of {info['n_planes']} diff planes of {p}"
+        dp['d'] = dp['d'].numpy()
+        for key in ('kl', 'log_ratio', 'shift', 'point_kl', 'point_log_ratio'):
+            dp[key] = np.stack([pl[key] for pl in dplanes]).mean(0)
+        dp['target_fraction'] = np.mean([pl['labels'] == info['target'] for pl in dplanes], axis=0).astype(np.float32)
+        dp['point_target_fraction'] = np.mean([pl['point_label'] == info['target'] for pl in dplanes], axis=0)
     torch.save(res, os.path.join(out_dir, 'result.pt'))
     summary = {
         'experiment': res['experiment'], 'context': res['context'], 'decoded_text': res['decoded_text'],
@@ -212,6 +323,11 @@ def merge(out_dir):
                    for p, pt in res['basin']['points'].items()},
         'max_kl_m_per_j': res['kl'][..., -1].reshape(-1, res['kl'].shape[2]).max(0).tolist(),
         'target_fraction_per_j': res['target_fraction'].reshape(-1, res['kl'].shape[2]).mean(0).tolist(),
+        'diff': {p: {'alpha': dp['alpha'], 'steered_text': dp['steered_text'], 'cos': dp['cos'],
+                     'd_norm_over_v': dp['d_norm'], 'kl_at_h_j': dp['point_kl'][:, -1].tolist(),
+                     'max_kl_m_per_j': dp['kl'][..., -1].reshape(-1, dp['kl'].shape[2]).max(0).tolist(),
+                     'target_fraction_per_j': dp['target_fraction'].reshape(-1, dp['kl'].shape[2]).mean(0).tolist()}
+                 for p, dp in res['diff'].items()},
     }
     with open(os.path.join(out_dir, 'summary.json'), 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=2, ensure_ascii=False, default=float)
@@ -264,11 +380,15 @@ def main():
                 if i % args.num_shards == args.shard:
                     run_basin(model, config, name, ctx, vectors[name], eos, ctx_dir(name, ctx))
         if args.stage in ('all', 'grid'):
-            units = [(i, k) for i in range(len(jobs)) for k in range(config['n_planes'])]
-            for u, (i, k) in enumerate(units):
+            units = [(i, p, k) for i in range(len(jobs)) for p in [None] + config['diff_points']
+                     for k in range(config['n_planes'])]
+            for u, (i, p, k) in enumerate(units):
                 if u % args.num_shards == args.shard:
                     name, ctx = jobs[i]
-                    run_plane(model, config, ctx, vectors[name], eos, ctx_dir(name, ctx), k)
+                    if p is None:
+                        run_plane(model, config, ctx, vectors[name], eos, ctx_dir(name, ctx), k)
+                    else:
+                        run_diff_plane(model, config, ctx, eos, ctx_dir(name, ctx), p, k)
     if args.stage in ('all', 'merge'):
         summaries = [merge(ctx_dir(name, ctx)) for name, ctx in jobs]
         with open(out('summary.json'), 'w', encoding='utf-8') as f:
@@ -276,6 +396,8 @@ def main():
         for s in summaries:
             print(f"{s['experiment']} / {s['context']['id']}: barrier {s['barrier_deg']}, target {s['target_deg']}, "
                   f"points {[(p, round(d['alpha'], 2), d['label'], d['passed']) for p, d in s['points'].items()]}")
+            for p, d in s['diff'].items():
+                print(f"  diff {p}: z={d['steered_text']!r}, cos(d_j, v)={[round(c, 3) for c in d['cos']]}")
 
 
 if __name__ == '__main__':

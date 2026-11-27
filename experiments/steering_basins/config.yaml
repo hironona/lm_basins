@@ -13,6 +13,7 @@ n_decoded: 4              # measure after the context and after each of the firs
 m: 4                      # joint KL over the next m tokens
 tree_nodes: 512           # KL estimator: prefix-tree nodes per depth (exact head) ...
 mc_samples: 512           # ... and Monte-Carlo samples for the tail beyond the tree
+diff_points: [classifier, speed_ray]  # steered points whose greedy trajectory z gives d_j = h_j - x_j (diff heatmaps)
 n_contexts: 1             # contexts drawn per experiment from its held-out pool
 seed: null                # seed of the context draw (null: a fresh draw every run)
 
